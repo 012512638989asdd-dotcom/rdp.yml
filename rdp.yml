@@ -1,0 +1,286 @@
+name: Windows Server 2022 RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Session duration (minutes)'
+        required: false
+        default: '360'
+      custom_port:
+        description: 'Custom RDP port (leave empty for default 3389)'
+        required: false
+        default: ''
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 720  # 12 hours max
+
+    steps:
+      - name: 🚀 Configure Windows Server 2022 RDP
+        shell: powershell
+        run: |
+          Write-Host "========================================="
+          Write-Host "  WINDOWS SERVER 2022 RDP CONFIGURATION"
+          Write-Host "========================================="
+          
+          # تحديد المنفذ (افتراضي 3389 أو مخصص)
+          $RDP_PORT = if ("${{ github.event.inputs.custom_port }}") { 
+              [int]${{ github.event.inputs.custom_port }} 
+          } else { 
+              3389 
+          }
+          
+          Write-Host "[*] Configuring RDP on port: $RDP_PORT"
+          
+          # 1. تمكين سطح المكتب البعيد
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # 2. تعطيل NLA (Network Level Authentication) للتوافق
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          
+          # 3. ضبط طبقة الأمان
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+          
+          # 4. تغيير منفذ RDP إذا لزم الأمر
+          if ($RDP_PORT -ne 3389) {
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "PortNumber" -Value $RDP_PORT -Force
+              Write-Host "[*] RDP port changed to: $RDP_PORT"
+          }
+          
+          # 5. إعداد جدار الحماية
+          netsh advfirewall firewall delete rule name="RDP-Custom"
+          netsh advfirewall firewall add rule name="RDP-Custom" `
+              dir=in action=allow protocol=TCP localport=$RDP_PORT
+          
+          # 6. إعدادات إضافية لـ Windows Server 2022
+          # تعطيل طلب كلمة المرور عند الخروج من وضع السكون
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0
+          powercfg /setactive SCHEME_CURRENT
+          
+          # تعطيل شاشة القفل التلقائي
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
+                           -Name "InactivityTimeoutSecs" -Value 0 -PropertyType DWord -Force
+          
+          # تحسين الأداء: تعطيل تأثيرات الرسوميات غير الضرورية
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+                           -Name "VisualFXSetting" -Value 2 -Force
+          
+          # تمكين تسجيل الدخول المتعدد لنفس المستخدم
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "fSingleSessionPerUser" -Value 0 -PropertyType DWord -Force
+          
+          Restart-Service -Name TermService -Force
+          Write-Host "[✓] RDP Service configured successfully"
+
+      - name: 👤 Create Admin User with Secure Password
+        shell: powershell
+        run: |
+          # توليد كلمة مرور قوية
+          Add-Type -AssemblyName System.Web
+          $username = "Administrator"
+          
+          # توليد كلمة مرور معقدة (16 حرف)
+          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          
+          # إنشاء المستخدم
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # التحقق من وجود المستخدم مسبقاً
+          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Set-LocalUser -Name $username -Password $securePass
+              Write-Host "[*] Updated existing user: $username"
+          } else {
+              New-LocalUser -Name $username -Password $securePass -FullName "System Administrator" `
+                            -Description "Remote Administrator" -AccountNeverExpires
+              Write-Host "[*] Created new user: $username"
+          }
+          
+          # إضافة المستخدم إلى مجموعات المسؤولين
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          
+          # حفظ بيانات الدخول كـ GitHub Environment Variable
+          $credString = "RDP_CREDS=User: $username | Password: $password | Port: ${{ github.event.inputs.custom_port }}"
+          echo $credString >> $env:GITHUB_ENV
+          
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          
+          # عرض معلومات محدودة (كلمة المرور تظهر في السجل)
+          Write-Host "[✓] User: $username"
+          Write-Host "[✓] Password: (hidden - see workflow output)"
+          Write-Host "[✓] Added to Administrators and Remote Desktop Users"
+
+      - name: 🔗 Install and Configure Tailscale
+        shell: powershell
+        run: |
+          Write-Host "[*] Installing Tailscale..."
+          
+          # تحميل أحدث إصدار من Tailscale
+          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tailscaleUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          Write-Host "[*] Tailscale installed successfully"
+
+      - name: 🌐 Connect to Tailscale Network
+        shell: powershell
+        run: |
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          
+          if (-not $authKey) {
+              Write-Error "❌ TAILSCALE_AUTH_KEY secret is not set!"
+              Write-Host "Please add your Tailscale auth key to GitHub Secrets"
+              exit 1
+          }
+          
+          # الاتصال بـ Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=$authKey `
+              --hostname="win2022-rdp-$env:GITHUB_RUN_ID" `
+              --accept-routes `
+              --accept-dns=false
+          
+          # انتظار الحصول على IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              Start-Sleep -Seconds 3
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $retries++
+              Write-Host "[*] Waiting for Tailscale IP... (attempt $retries/15)"
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "❌ Failed to get Tailscale IP"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "[✓] Tailscale connected successfully!"
+          Write-Host "[✓] Tailscale IP: $tsIP"
+
+      - name: 🧪 Test RDP Connectivity
+        shell: powershell
+        run: |
+          $rdpPort = if ("${{ github.event.inputs.custom_port }}") { 
+              [int]${{ github.event.inputs.custom_port }} 
+          } else { 
+              3389 
+          }
+          
+          Write-Host "[*] Testing RDP connection on port $rdpPort..."
+          
+          # اختبار الاتصال
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $rdpPort -WarningAction SilentlyContinue
+          
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "[✓] TCP connectivity successful!"
+          } else {
+              Write-Warning "TCP test failed, but RDP might still work"
+          }
+          
+          # اختبار إضافي باستخدام netstat
+          $listening = netstat -an | Select-String ":$rdpPort " | Select-String "LISTENING"
+          if ($listening) {
+              Write-Host "[✓] RDP service is listening on port $rdpPort"
+          } else {
+              Write-Warning "RDP service might not be listening on port $rdpPort"
+          }
+
+      - name: 📊 Display Connection Information
+        shell: powershell
+        run: |
+          $rdpPort = if ("${{ github.event.inputs.custom_port }}") { 
+              [int]${{ github.event.inputs.custom_port }} 
+          } else { 
+              3389 
+          }
+          
+          $duration = "${{ github.event.inputs.duration }}"
+          if (-not $duration) { $duration = "360" }
+          
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host "     🖥️  WINDOWS SERVER 2022 READY  🖥️"
+          Write-Host "========================================="
+          Write-Host ""
+          Write-Host "🔗 CONNECTION DETAILS:"
+          Write-Host "   • Address: $env:TAILSCALE_IP`:$rdpPort"
+          Write-Host "   • Username: $env:RDP_USER"
+          Write-Host "   • Password: $env:RDP_PASS"
+          Write-Host ""
+          Write-Host "📋 RDP FILE (save as 'server.rdp'):"
+          Write-Host "   ----------------------------------------"
+          Write-Host "   full address:s:$env:TAILSCALE_IP`:$rdpPort"
+          Write-Host "   username:s:$env:RDP_USER"
+          Write-Host "   prompt for credentials:i:0"
+          Write-Host "   authentication level:i:0"
+          Write-Host "   enablecredsspsupport:i:0"
+          Write-Host "   ----------------------------------------"
+          Write-Host ""
+          Write-Host "⏱️  Session will stay active for: $duration minutes"
+          Write-Host "🛑 To stop: Cancel this workflow in GitHub Actions"
+          Write-Host ""
+          Write-Host "========================================="
+          
+          # إضافة معلومات إضافية للمستخدم
+          Write-Host ""
+          Write-Host "[💡] Quick Connect Command (Windows):"
+          Write-Host "     mstsc.exe /v:$env:TAILSCALE_IP`:$rdpPort"
+          Write-Host ""
+          Write-Host "[💡] Quick Connect Command (Linux/Mac):"
+          Write-Host "     rdesktop $env:TAILSCALE_IP`:$rdpPort -u $env:RDP_USER"
+          Write-Host ""
+
+      - name: 🔄 Keep Session Alive
+        shell: powershell
+        run: |
+          $durationMinutes = [int]("${{ github.event.inputs.duration }}")
+          if ($durationMinutes -eq 0) { $durationMinutes = 360 }
+          
+          $endTime = (Get-Date).AddMinutes($durationMinutes)
+          $checkInterval = 60  # seconds
+          
+          Write-Host "[*] Keeping session alive for $durationMinutes minutes"
+          Write-Host "[*] End time: $endTime"
+          Write-Host ""
+          
+          while ((Get-Date) -lt $endTime) {
+              $remaining = [int]((New-TimeSpan -End $endTime).TotalMinutes)
+              $hours = [math]::Floor($remaining / 60)
+              $minutes = $remaining % 60
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - Remaining: ${hours}h ${minutes}m"
+              
+              # منع السكون
+              [System.GC]::Collect()
+              Start-Sleep -Seconds $checkInterval
+          }
+          
+          Write-Host ""
+          Write-Host "[✓] Session completed after $durationMinutes minutes"
+
+      - name: 🧹 Cleanup (on cancellation)
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "[*] Cleaning up..."
+          
+          # إزالة قواعد جدار الحماية
+          netsh advfirewall firewall delete rule name="RDP-Custom" 2>$null
+          
+          # إزالة المستخدم (اختياري)
+          # Remove-LocalUser -Name "$env:RDP_USER" -ErrorAction SilentlyContinue
+          
+          Write-Host "[✓] Cleanup completed"
