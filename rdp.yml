@@ -1,4 +1,4 @@
-name: Windows Server 2022 RDP
+name: Windows Server RDP
 
 on:
   workflow_dispatch:
@@ -7,164 +7,88 @@ on:
         description: 'Session duration (minutes)'
         required: false
         default: '360'
-      custom_port:
-        description: 'Custom RDP port (leave empty for 3389)'
-        required: false
-        default: ''
 
 jobs:
-  windows-server-2022-rdp:
+  rdp:
     runs-on: windows-latest
     timeout-minutes: 720
 
     steps:
-      - name: Verify Windows Server 2022
+      - name: Setup RDP
         shell: powershell
         run: |
-          Write-Host "========================================="
-          Write-Host "  WINDOWS SERVER 2022 RDP SESSION"
-          Write-Host "========================================="
-          
-          $osInfo = Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
-          Write-Host "OS: $($osInfo.WindowsProductName)"
-          Write-Host "Version: $($osInfo.WindowsVersion)"
-
-      - name: Configure RDP on Windows Server 2022
-        shell: powershell
-        run: |
-          $RDP_PORT = if ("${{ github.event.inputs.custom_port }}") { 
-              [int]${{ github.event.inputs.custom_port }} 
-          } else { 
-              3389 
-          }
-          
-          Write-Host "Configuring RDP on port: $RDP_PORT"
-          
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          
-          if ($RDP_PORT -ne 3389) {
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                               -Name "PortNumber" -Value $RDP_PORT -Force
-          }
-          
-          netsh advfirewall firewall delete rule name="RDP-Server2022"
-          netsh advfirewall firewall add rule name="RDP-Server2022" `
-              dir=in action=allow protocol=TCP localport=$RDP_PORT
-          
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
-                           -Name "InactivityTimeoutSecs" -Value 0 -PropertyType DWord -Force
-          
-          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
-                           -Name "fSingleSessionPerUser" -Value 0 -PropertyType DWord -Force
-          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured successfully"
 
-      - name: Create Admin User
+      - name: Create User
         shell: powershell
         run: |
-          Add-Type -AssemblyName System.Web
-          $username = "Admin2022"
-          $password = [System.Web.Security.Membership]::GeneratePassword(14, 3)
-          
+          $password = "Admin@" + ([guid]::NewGuid().ToString().Substring(0,12))
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-          if ($existingUser) {
-              Set-LocalUser -Name $username -Password $securePass
-          } else {
-              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          }
-          
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          
-          echo "RDP_USER=$username" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-          
-          Write-Host "User created: $username"
+          New-LocalUser -Name "Admin" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Admin"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Admin"
+          echo "PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
 
-      - name: Connect to Tailscale
+      - name: Connect Tailscale
         shell: powershell
         run: |
-          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="win-$env:GITHUB_RUN_ID"
           
-          if (-not $authKey) {
-              Write-Error "TAILSCALE_AUTH_KEY not set"
-              exit 1
+          Write-Host "Waiting for Tailscale to connect..."
+          Start-Sleep -Seconds 20
+          
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "IP from command: '$ip'"
+          
+          if (-not $ip) {
+              Write-Host "Retrying..."
+              Start-Sleep -Seconds 10
+              $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
           }
           
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-              --authkey=$authKey `
-              --hostname="winserver2022-$env:GITHUB_RUN_ID"
-          
-          $tsIP = $null
-          for ($i = 0; $i -lt 15; $i++) {
-              Start-Sleep -Seconds 3
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) { break }
+          if (-not $ip) {
+              $ip = "CHECK_TAILSCALE_MANUALLY"
+              Write-Host "WARNING: Could not auto-detect IP"
           }
           
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+          echo "IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Final Tailscale IP: $ip"
 
-      - name: Display Connection Info
+      - name: Show Info
         shell: powershell
         run: |
-          $port = if ("${{ github.event.inputs.custom_port }}") { 
-              "${{ github.event.inputs.custom_port }}" 
-          } else { 
-              "3389" 
-          }
-          
           Write-Host ""
           Write-Host "========================================="
-          Write-Host "   WINDOWS SERVER 2022 READY"
+          Write-Host "  CONNECTION INFO"
           Write-Host "========================================="
           Write-Host ""
-          Write-Host "CONNECTION DETAILS:"
-          Write-Host "  Address: $env:TAILSCALE_IP:$port"
-          Write-Host "  Username: $env:RDP_USER"
-          Write-Host "  Password: $env:RDP_PASS"
+          Write-Host "Address: $env:IP"
+          Write-Host "Username: Admin"
+          Write-Host "Password: $env:PASSWORD"
           Write-Host ""
-          Write-Host "Quick Connect:"
-          Write-Host "  mstsc.exe /v:$env:TAILSCALE_IP:$port"
+          Write-Host "RDP Command:"
+          Write-Host "  mstsc.exe /v:$env:IP"
           Write-Host ""
           Write-Host "========================================="
+          Write-Host ""
+          Write-Host "IF IP IS MISSING, run this in Tailscale CLI:"
+          Write-Host "  tailscale ip -4"
+          Write-Host ""
 
-      - name: Keep Session Alive
+      - name: Keep Alive
         shell: powershell
         run: |
           $duration = [int]("${{ github.event.inputs.duration }}")
-          if ($duration -eq 0) { $duration = 360 }
-          
-          $end = (Get-Date).AddMinutes($duration)
-          
-          while ((Get-Date) -lt $end) {
-              $remaining = [int]((New-TimeSpan -End $end).TotalMinutes)
-              Write-Host "$(Get-Date -Format 'HH:mm:ss') Server 2022 active - $remaining min left"
+          for ($i = 0; $i -lt $duration; $i++) {
+              Write-Host "$(Get-Date -Format 'HH:mm:ss') Session active - $($duration - $i) minutes left"
               Start-Sleep -Seconds 60
           }
-
-      - name: Cleanup
-        if: always()
-        shell: powershell
-        run: |
-          Write-Host "Cleaning up..."
-          netsh advfirewall firewall delete rule name="RDP-Server2022" 2>$null
-          Write-Host "Cleanup completed"
